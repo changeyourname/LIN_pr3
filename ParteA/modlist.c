@@ -9,11 +9,18 @@
         echo remove <number> > /proc/modlist    remove all ocurrences of <number>
         cat /proc/modlist                       prints the whole list
         echo cleanup > /proc/modlist            delete the list content
+
+    CONDITIONAL COMPILATION
+        STRING_MODE
+            If defined, the list contains string values, if not, integer values.
+        TEST_NO_LOCK
+            If defined, the spin locks are not used, to test the failures it causes.
+
+    COMMENTARIES
+        Compiling with TEST_NO_LOCK does not show the expected failures either...
 =======================================================================================
 */
 
-//#define STRING_MODE
-// if defined, the list works with fixed-lenght strings
 
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -30,12 +37,17 @@ MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Modlist kernel module - FDI-UCM");
 MODULE_AUTHOR("Daniel Pinto, Javier Bermudez");
 
-DEFINE_SPINLOCK(sp);
 
-#define BUFFER_LENGTH   PAGE_SIZE
+#ifndef TEST_NO_LOCK
+DEFINE_RWLOCK(sp);
+#endif
+
+
+#define BUFFER_LENGHT   50
+#define READ_BUFFER_LENGHT 200
 
 #ifdef STRING_MODE
- #define STRING_LENGHT 100
+ #define STRING_LENGHT 50
 #endif
 
 #ifdef STRING_MODE
@@ -46,19 +58,17 @@ DEFINE_SPINLOCK(sp);
 
 
 static struct proc_dir_entry *proc_entry;
-static char *aux_buffer;
-static char *command;
 
 /* Linked list */
 struct list_head mylist;
 
 /* List nodes */
 typedef struct {
-   #ifdef STRING_MODE
+#ifdef STRING_MODE
     char data[STRING_LENGHT];
-   #else
+#else
     int data;
-   #endif
+#endif
     struct list_head links;
 }list_item_t;
 
@@ -69,11 +79,11 @@ int botupcmp(void *priv, struct list_head *a, struct list_head *b) {
     entry_a = list_entry(a, list_item_t, links);
     entry_b = list_entry(b, list_item_t, links);
 
-   #ifndef STRING_MODE
+#ifndef STRING_MODE
     return (entry_a->data - entry_b->data);
-   #else
+#else
     return strcasecmp(entry_a->data, entry_b->data);
-   #endif
+#endif
 }
 
 
@@ -81,67 +91,79 @@ static ssize_t modlist_read(struct file *filp, char __user *buf, size_t len, lof
 
     list_item_t *pos;
     int nchars, nbytes, ret = 0;
-    char *buff_pos = aux_buffer;
-   #ifndef STRING_MODE
+    char *buff_pos = buf;
+
+#ifndef STRING_MODE
     char int_buf[21]; //max digits posible in 64bit integer
-   #endif
+#else
+    char int_buf[STRING_LENGHT+1];
+#endif
 
     // we return the string in just one call
     if ((*off) > 0)
         return 0;
 
 
+    // lock for read
+#ifndef TEST_NO_LOCK
+    read_lock(&sp);
+#endif
+
     list_for_each_entry(pos, &mylist, links) {
 
         // Check if there is enough space in buffer
-       #ifdef STRING_MODE
-        nbytes = strlen(pos->data);
+#ifdef STRING_MODE
+        nbytes = strlen(pos->data) + sizeof(char);  // string lenght + '\n'
         nchars = nbytes/sizeof(char);
-       #else
-        nchars = sprintf(int_buf, "%d", pos->data);
-        nbytes = nchars*sizeof(char);
-       #endif
-        if ( (nbytes + 2*sizeof(char)) > (len-ret) )   // string + \n\0
+
+        strcpy(int_buf, pos->data);
+        int_buf[nchars-1] = '\n';
+
+#else
+        nchars = sprintf(int_buf, "%d\n", pos->data);
+        nbytes = nchars*sizeof(char);   // string lenght + '\n'
+#endif
+        if ( (nbytes) > (len-ret) )
             break;
 
-    	spin_lock(&sp);
-
         // Copy to buff    
-       #ifndef STRING_MODE
-        memcpy(buff_pos, int_buf, nbytes);
-       #else
-        memcpy(buff_pos, pos->data, nbytes);
-       #endif
-
-		spin_unlock(&sp);
+        if( copy_to_user(buff_pos, int_buf, nbytes) ) {
+            return -EFAULT;
+        }
 
         buff_pos += nchars;
-        *buff_pos = '\n';
-        buff_pos += 1;
-        ret = ret + nbytes + 1;
+        ret += nbytes;
     }
-    *buff_pos = '\0';
+    // unlock
+#ifndef TEST_NO_LOCK
+    read_unlock(&sp);
+#endif
+    
+    //int_buf[0] = '\0';
+    //if( copy_to_user(buff_pos, int_buf, sizeof(char)) ) {
+    //    return -EFAULT;
+    //}
 
-    if (copy_to_user(buf, aux_buffer, ret)) {
-        return -EFAULT;
-    }
     *off+=ret;
- 
+
     return ret;
 }
 
 
 static ssize_t modlist_write(struct file *filp, const char __user *buf, size_t len, loff_t *off) {
 
-    list_item_t *pos, *temp;
-   #ifndef STRING_MODE
-    int value;
-   #else
-    char *value;
-    value = (char*)vmalloc(sizeof(char)*STRING_LENGHT);
-   #endif
+    char aux_buffer[BUFFER_LENGHT];
+    char command[BUFFER_LENGHT];
 
-    if (len > BUFFER_LENGTH) {
+    list_item_t *pos, *temp;
+
+#ifndef STRING_MODE
+    int value;
+#else
+    char value[STRING_LENGHT];
+#endif
+
+    if (len >= BUFFER_LENGHT) {
         printk(KERN_INFO "Modlist: input too large\n");
         return -ENOSPC;
     }
@@ -153,11 +175,11 @@ static ssize_t modlist_write(struct file *filp, const char __user *buf, size_t l
     *off+=len;
 
     // parse argument (it seems to work fine if there is no value in input)
-   #ifndef STRING_MODE
+#ifndef STRING_MODE
     sscanf(aux_buffer, "%s %d", command, &value);
-   #else
+#else
     sscanf(aux_buffer, "%s %s", command, value);
-   #endif
+#endif
 
     // COMMAND: Add <number>
     if (!strcasecmp(command, "add")) {
@@ -168,61 +190,67 @@ static ssize_t modlist_write(struct file *filp, const char __user *buf, size_t l
             printk(KERN_INFO "Modlist: Can't add item to list\n");
             return -ENOMEM;
         }
-		spin_lock(&sp);
-       #ifndef STRING_MODE
+#ifndef STRING_MODE
         temp->data = value;
-       #else
+#else
         memcpy(temp->data, value, STRING_LENGHT*sizeof(char));
-       #endif
-        list_add_tail(&(temp->links), &mylist);
+#endif
 
-		spin_unlock(&sp);
+#ifndef TEST_NO_LOCK    
+        write_lock(&sp);
+#endif
+        list_add_tail(&(temp->links), &mylist);
+#ifndef TEST_NO_LOCK
+		write_unlock(&sp);
+#endif
     }
     // COMMAND: remove <number>
     else if (!strcasecmp(command, "remove")) {
+#ifndef TEST_NO_LOCK
+        write_lock(&sp);
+#endif
         list_for_each_entry_safe(pos, temp, &mylist, links) {
-			spin_lock(&sp);
-           #ifndef STRING_MODE
+#ifndef STRING_MODE
             if (pos->data == value) {
-           #else
+#else
             if (!strcasecmp(pos->data, value) ) {
-           #endif  
+#endif  
                 trace_printk("Modlist: removed "DATA_PRINT_FORMAT"\n", value);
                 list_del(&(pos->links));
-			
-				spin_unlock(&sp);
 
                 vfree(pos);
             }
         }
+#ifndef TEST_NO_LOCK
+        write_unlock(&sp);
+#endif
     }
     // COMMAND: cleanup
     else if (!strcasecmp(command, "cleanup")) {
         trace_printk("Modlist: cleanup\n");
+#ifndef TEST_NO_LOCK
+        write_lock(&sp);
+#endif
         list_for_each_entry_safe(pos, temp, &mylist, links) {
-			spin_lock(&sp);
-
             trace_printk("Modlist: removed "DATA_PRINT_FORMAT"\n", pos->data);
             list_del(&(pos->links));
-
-			spin_unlock(&sp);
-
             vfree(pos);
         }
+#ifndef TEST_NO_LOCK
+        write_unlock(&sp);
+#endif
     }
     // COMMAND: sort
     else if (!strcasecmp(command, "sort")) {
-		spin_lock(&sp);
-	
         trace_printk("Modlist: sort\n");
+#ifndef TEST_NO_LOCK
+        write_lock(&sp);
+#endif
         list_sort(NULL, &mylist, botupcmp);
-
-		spin_unlock(&sp);
+#ifndef TEST_NO_LOCK
+		write_unlock(&sp);
+#endif
     }
-
-   #ifdef STRING_MODE
-    vfree(value);
-   #endif
 
     return len;
 }
@@ -235,37 +263,20 @@ static const struct file_operations proc_entry_fops = {
 
 int init_modlist_module( void ){
 
-    aux_buffer = (char*)vmalloc(BUFFER_LENGTH);
-    if (aux_buffer == NULL) {
-        printk(KERN_INFO "Modlist: Can't create input buffer\n");
-        return -ENOMEM;
-    }
-
-    command = (char*)vmalloc(BUFFER_LENGTH);
-    if (command == NULL) {
-        vfree(aux_buffer);
-        printk(KERN_INFO "Modlist: Can't create command buffer\n");
-        return -ENOMEM;
-    }
-
     // init resources
     INIT_LIST_HEAD(&mylist);
 
     proc_entry = proc_create("modlist", 0666, NULL, &proc_entry_fops);
     if (proc_entry == NULL) {
-        vfree(aux_buffer);
-        vfree(command);
         printk(KERN_INFO "Modlist: Can't create /proc entry\n");
         return -ENOMEM;
     }
-    
-	spin_lock_init(&sp);
 
-   #ifdef STRING_MODE
+#ifdef STRING_MODE
     trace_printk("Modlist: MODULE LOADED (string) =========\n");
-   #else
+#else
     trace_printk("Modlist: MODULE LOADED (int) ==========\n");
-   #endif
+#endif
     printk(KERN_INFO "Modlist: Module loaded.\n");
     return 0;
 }
@@ -281,11 +292,11 @@ void exit_modlist_module( void ){
     }
 
     remove_proc_entry("modlist", NULL);
-   #ifdef STRING_MODE
+#ifdef STRING_MODE
     trace_printk("Modlist: MODULE UNLOADED (string) =========\n");
-   #else
+#else
     trace_printk("Modlist: MODULE UNLOADED (int) =========\n");
-   #endif
+#endif
     printk(KERN_INFO "Modlist: Module unloaded.\n");
 }
 
