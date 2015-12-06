@@ -285,11 +285,17 @@ void exit_modlist_module( void ){
     
     list_item_t *temp, *pos;
 
+#ifndef TEST_NO_LOCK
+        write_lock(&sp);
+#endif
     // free list resources
     list_for_each_entry_safe(pos, temp, &mylist, links) {
         list_del(&(pos->links));
         vfree(pos);
     }
+#ifndef TEST_NO_LOCK
+		write_unlock(&sp);
+#endif
 
     remove_proc_entry("modlist", NULL);
 #ifdef STRING_MODE
