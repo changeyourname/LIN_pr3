@@ -1,0 +1,167 @@
+
+mutex mtx;
+
+condvar prod;
+condvar cons;
+int prod_count = 0;
+int cons_count = 0;
+
+cbuffer_t* cbuffer;
+
+
+void fifoproc_open(bool abre_para_lectura)
+{
+    // Podría poner los locks dentro de cada rama del if para
+    // acoplar la regiín atómica a la sección crítica, pero
+    // no hay demasiada diferencia...
+    lock(mtx);
+	if( abre_para_lectura ){
+		cons_count++;
+    
+        // Si es el único consumidor, todos los posibles productores estarían
+        // esperándole (no podría haber productores en la cola de escritura)
+        if( cons_count == 1 ) {
+            cond_broadcast(prod);
+        }
+
+        // Si no hay ningún productor, esperar a que llegue alguno
+        while( prod_count <= 0 ) {
+            cond_wait(cons);
+        }
+
+	} else{
+	    prod_count++;
+
+        if( prod_count == 1 ) {
+            cond_broadcast(cons);
+        }
+
+        while( cons_count <= 0 ) {
+            cond_wait(prod);
+        }
+
+	}
+    unlock(mtx);
+
+}
+
+
+void fifoproc_release(bool lectura){
+
+    lock(mtx);
+	if ( lectura ){
+		cons_count--;
+	} else{
+	    prod_count--;
+	}
+
+    //Si no queda nadie usando el FIFO, eliminar su contenido
+    // Como no hay nadie, nadie puede estar en las colas de espera, así que no es
+    // necesario avisar.
+    if( cons_count == 0 && prod_count == 0 ) {
+        clear_cbuffer_t(cbuffer);
+        unlock(mtx);
+        return;
+    }
+    
+    // Si no quedan consumidores, hay que avisar a todos los productores
+    // para que comprueben la condición (vaciar cola de productores)
+    if( cons_count == 0 ) {
+        cond_broadcast(prod);
+        unlock(mtx);
+        return;
+    }
+
+    // Si no quedan productores, hay que avisar a todos los consumidores
+    // para que comprueben la condición (vaciar cola de consumidores)
+    if( prod_count == 0 ) {
+        cond_broadcast(cons);
+        unlock(mtx);
+        return;
+    }
+
+    unlock(mtx);
+}
+
+
+int fifoproc_read( __user char * buff, int len){
+    char kbuffer[MAX_KBUF];
+    int actual_len;
+
+    if( len > MAX_CBUFFER_LEN || len > MAX_KBUF ) {
+        return error;
+    }
+
+    // hacerse con el MUTEX
+    lock(mtx);
+
+    // Esperar a que haya items para leer (debe haber algún productor)
+    // Si en el tiempo desde que salió el último productor (todos los consumidores quedan
+    // atrapados en el mutex) hasta que comprueba la condición el último consumidor,
+    // llega otro productor, los consumidores que aún no hayan salido, volverán a entrar
+    // en la cola de cond_wait, así que no se darán cuenta de que el primer productor
+    // salió
+    while( size_cbuffer_t(cbuffer) < len && prod_count > 0 ) {
+        cond_wait(cons, mtx);
+    }
+
+    // Si no hay productores y el buffer está vacío, salir
+    if( prod_count == 0 && is_empty_cbuffer_t(cbuffer) ) {
+        unlock(mtx);
+        return 0;
+    }
+
+    // Si ha llegado aquí, es porque hay por lo menos "len" elementos en el buffer
+    // o no queda ningún productor, pero el buffer no está vacío.
+    actual_len = (len <= size_cbuffer_t(cbuffer))? len : size_cbuffer_t(cbuffer);
+
+    remove_items_cbuffer_t(cbuffer, kbuffer, actual_len);
+
+    // Despertar a posibles productores bloqueados
+    cond_signal(prod);
+
+    // Liberar el MUTEX
+    unlock(mtx);
+
+    copy_to_user(buff, kbuffer, actual_len);
+    
+    return actual_len;
+}
+
+
+int fifoproc_write( __user const char * buff, int len){
+    char kbuffer[MAX_KBUF];
+
+    if( len > MAX_CBUFFER_LEN || len > MAX_KBUF ) {
+        return error;
+    }
+    if( copy_from_user(kbuffer, buff, len) ) {
+        return error;
+    }
+	
+    // hacerse con el MUTEX
+    lock(mtx);
+
+    // Esperar hasta que haya hueco para insertar (debe haber algún consumidor)
+    while( nr_gaps_cbuffer_t(cbuffer) < len && cons_count>0 ) {
+        cond_wait(prod, mtx);
+    }
+
+
+    // Si no hay consumidores, salir
+    if ( cons_count == 0 ) {
+        unlock(mtx);
+        return -EPIPE;
+    }
+
+    insert_items_cbuffer_t(cbuffer, kbuffer, len);
+
+    // Despertar a posibles consumidores bloqueados
+    cond_signal(cons);
+    
+    // liberar el MUTEX
+    unlock(mtx);
+
+    return len;
+}
+
