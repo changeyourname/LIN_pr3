@@ -26,10 +26,9 @@ for r_script in {0..2}; do
     bash script_reader.sh 0 20 ${r_script} &
 done
 
-#for s_script in {0..3}; do
-#    bash script_sort.sh 0 3 &
-#done
-
+for s_script in {0..3}; do
+    bash script_sort.sh 0 3 &
+done
 
 JOBS=`jobs -rp`
 echo -n " Waiting for the proccesses to end "
