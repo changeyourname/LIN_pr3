@@ -54,7 +54,7 @@ int nr_cons_waiting = 0;
 /*
  * waits in the "sem" queue until someone wakes it
  * It behaves the same as var_cond_wait, but interruptible
- * If interrupted, it does not have the mutex Do not try to release it
+ * If interrupted, it does not have the mutex. Do not try to release it
  * returns 0, or -1 if interrupted
  */
 int sem_wait_interruptible(struct semaphore *sem, struct semaphore *mutex, int *waiting);
