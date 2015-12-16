@@ -141,7 +141,7 @@ static int fifoproc_release(struct inode *inode, struct file *file) {
     }    
     /* As there are no cons, wake all the waiting prods to allow them realize this situation */
     else if( cons_count == 0 ) {
-        sem_broadcast(&sem_prod, &nr_prod_waiting);;
+        sem_broadcast(&sem_prod, &nr_prod_waiting);
     }
     /* As there are no prods, wake all the waiting cons to allow them realize this situation */
     else if( prod_count == 0 ) {
